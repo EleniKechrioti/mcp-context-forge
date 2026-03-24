@@ -2,11 +2,11 @@
 
 ⚠️ **Security Notice**: HTTP Header Passthrough is **disabled by default** for security reasons. Only enable this feature if you understand the security implications and have reviewed which headers should be passed through to backing MCP servers.
 
-The MCP Gateway supports **HTTP Header Passthrough**, allowing specific headers from incoming client requests to be forwarded to backing MCP servers. This feature is essential for maintaining authentication context and request tracing across the gateway infrastructure.
+ContextForge supports **HTTP Header Passthrough**, allowing specific headers from incoming client requests to be forwarded to backing MCP servers. This feature is essential for maintaining authentication context and request tracing across the gateway infrastructure.
 
 ## Overview
 
-When clients make requests through the MCP Gateway, certain headers (like authentication tokens or trace IDs) need to be preserved and passed to the underlying MCP servers. The header passthrough feature provides a configurable, secure way to forward these headers while preventing conflicts with existing authentication mechanisms.
+When clients make requests through ContextForge, certain headers (like authentication tokens or trace IDs) need to be preserved and passed to the underlying MCP servers. The header passthrough feature provides a configurable, secure way to forward these headers while preventing conflicts with existing authentication mechanisms.
 
 ## Key Features
 
@@ -126,7 +126,7 @@ ENABLE_OVERWRITE_BASE_HEADERS=true
 **Prerequisites**:
 
 1. Set `ENABLE_HEADER_PASSTHROUGH=true` in your environment
-2. Restart the MCP Gateway service
+2. Restart ContextForge service
 
 #### Global Configuration
 Access the admin interface to set global passthrough headers that apply to all gateways by default.
@@ -195,6 +195,20 @@ Authorization: Bearer <your-jwt-token>
 3. **Conflict Check**: System verifies no conflicts with existing auth headers
 4. **Forwarding**: Allowed headers are added to requests sent to backing MCP servers
 
+### Transport Coverage
+
+Passthrough headers are forwarded consistently across all transports:
+
+| Transport | Path | Mechanism |
+|-----------|------|-----------|
+| REST `/rpc` | Direct | Headers captured per HTTP request |
+| Streamable HTTP `/mcp` | Direct | Headers stored in `request_headers_var` context variable |
+| SSE `/servers/{id}/sse` | Loopback | Headers captured at connection time, forwarded in internal `/rpc` calls |
+| WebSocket `/ws` | Loopback | Headers captured at WebSocket handshake, forwarded in internal `/rpc` calls |
+| Streamable HTTP (affinity) | Loopback | Headers extracted per request and forwarded to the affinity target |
+
+For loopback transports (SSE, WebSocket, Streamable HTTP affinity), gateway-internal headers (`Authorization`, `Content-Type`, session IDs, proxy-user identity) are never forwarded — they are filtered at both extraction and merge time for defense-in-depth.
+
 ### Configuration Hierarchy
 
 The system follows this priority order:
@@ -207,7 +221,7 @@ The system follows this priority order:
 
 ```mermaid
 graph LR
-    A[Client Request] --> B[MCP Gateway]
+    A[Client Request] --> B[ContextForge]
     B --> C{Check Passthrough Config}
     C --> D[Extract Configured Headers]
     D --> E[Conflict Prevention Check]
@@ -423,7 +437,7 @@ The API returns the virtual server details including its unique ID (e.g., `aa998
 
 Connect any MCP-compatible client to the virtual server, providing authentication via passthrough headers. The client must supply:
 
-1. **Gateway Authentication** - Token to authenticate with Context Forge Gateway (`Authorization` header)
+1. **Gateway Authentication** - Token to authenticate with ContextForge Gateway (`Authorization` header)
 2. **MCP Server Authentication** - Token forwarded to the upstream MCP server (`X-Upstream-Authorization` header)
 
 #### Example: Claude Desktop Configuration
@@ -459,7 +473,7 @@ Add the following configuration to Claude Desktop's MCP settings:
 |-----------|---------|
 | `mcp-remote` | NPM package for remote MCP connections |
 | `http://localhost:4444/servers/...` | Virtual server endpoint URL |
-| `Authorization` header | Authenticates with Context Forge Gateway |
+| `Authorization` header | Authenticates with ContextForge Gateway |
 | `X-Upstream-Authorization` header | Forwarded to the upstream MCP server |
 | `GATEWAY_AUTH_TOKEN` | JWT or Bearer token for gateway access |
 | `MCP_SERVER_AUTH_TOKEN` | Bearer token for the authenticated MCP server |
@@ -469,7 +483,7 @@ Add the following configuration to Claude Desktop's MCP settings:
 Replace the placeholder tokens with actual values:
 
 ```bash
-# Gateway authentication token (obtained from Context Forge)
+# Gateway authentication token (obtained from ContextForge)
 GATEWAY_AUTH_TOKEN="Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 
 # MCP server authentication token (your server's auth token)
@@ -481,7 +495,7 @@ MCP_SERVER_AUTH_TOKEN="Bearer super-secret-123"
 ```mermaid
 sequenceDiagram
     participant Client as MCP Client
-    participant Gateway as Context Forge Gateway
+    participant Gateway as ContextForge Gateway
     participant MCP as MCP Server
 
     Note over Gateway,MCP: Step 1: One-Time Registration
@@ -512,12 +526,18 @@ sequenceDiagram
 - ✅ **Check**: Did you restart the gateway after setting the flag?
 - ✅ **Check**: Are you seeing "Header passthrough is disabled" in debug logs?
 
+**Note**: `X-Upstream-Authorization` is always forwarded regardless of the `ENABLE_HEADER_PASSTHROUGH` flag. If only `X-Upstream-Authorization` is missing, check the transport-specific notes below.
+
 **Other Causes**:
 
 - Verify header names in configuration match exactly (case-insensitive matching)
 - Check for authentication conflicts in logs
 - Ensure gateway configuration overrides aren't blocking headers
 - Verify header names pass validation (only letters, numbers, hyphens allowed)
+
+**Transport-Specific Notes**:
+
+All transports (REST, SSE, WebSocket, Streamable HTTP) forward passthrough headers consistently. For SSE and WebSocket, headers are captured once at connection/handshake time and reused for the lifetime of the session. If you change passthrough header configuration, existing SSE/WebSocket connections will not pick up the new configuration until the client reconnects.
 
 #### Authentication Conflicts
 If you see warnings like:
@@ -566,6 +586,9 @@ Look for log entries containing:
 - `Adding passthrough header` - Header successfully forwarded
 - `Invalid header name` - Header name validation failed
 - `Header value became empty after sanitization` - Header value was sanitized away
+- `Extracted N passthrough header(s) for loopback` - Headers captured for SSE/WebSocket/Streamable HTTP loopback
+- `Failed to extract passthrough headers` - Error during loopback header extraction (upstream auth may not reach MCP servers)
+- `Invalidated global_config_cache and _loopback_allowlist_cache` - Passthrough configuration caches refreshed
 
 ## API Reference
 
@@ -613,7 +636,7 @@ When upgrading to a version with header passthrough:
 
 ## Testing with the Built-in Test Tool
 
-The MCP Gateway admin interface includes a built-in test tool with passthrough header support:
+ContextForge admin interface includes a built-in test tool with passthrough header support:
 
 ### Using the Test Tool
 

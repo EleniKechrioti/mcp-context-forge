@@ -1,6 +1,6 @@
 # Multi-Tenancy Architecture
 
-The MCP Gateway implements a comprehensive multi-tenant architecture that provides secure isolation, flexible resource sharing, and granular access control. This document describes the complete multi-tenancy design, user lifecycle, team management, and resource scoping mechanisms.
+ContextForge implements a comprehensive multi-tenant architecture that provides secure isolation, flexible resource sharing, and granular access control. This document describes the complete multi-tenancy design, user lifecycle, team management, and resource scoping mechanisms.
 
 ## Overview
 
@@ -286,8 +286,9 @@ Applies to Tools, Servers, Resources, Prompts, and A2A Agents. All resources are
 
 - Private:
 
-  - Who sees it: Only the resource owner (owner_email).
+  - Who sees it: Only the resource owner (owner_email), and only when their token is not a public-only token (token_teams must be non-empty).
   - Team members cannot see or use it unless they are the owner.
+  - Public-only tokens (token_teams=[]) cannot access private resources even as the owner.
   - Mutations: Owner and Platform Admin can update/delete; team owners may be allowed by policy (see Enhancements).
 
 - Team:
@@ -302,7 +303,9 @@ Applies to Tools, Servers, Resources, Prompts, and A2A Agents. All resources are
 
 Enforcement summary:
 
-- Listing queries include resources where (a) owner_email == user.email, (b) team_id ∈ user_teams with visibility ∈ {team, public}, and (c) visibility == public.
+- Listing queries include resources where (a) visibility == public, (b) team_id ∈ token_teams with visibility ∈ {team, public}, or (c) owner_email == user.email with visibility == private.
+- Owner-based access applies only to private resources. Owners cannot use ownership to bypass team scoping for team-visibility resources outside their token scope.
+- Public-only tokens (token_teams=[]) see only public resources — owner and team access are both suppressed.
 - Read follows the same rules as list; write operations require ownership or delegated/team administrative rights.
 
 ---
@@ -311,11 +314,22 @@ Enforcement summary:
 
 ### How Token Scoping Works
 
-Token scoping is the mechanism that determines which resources a user can **see** based on the `teams` claim in their JWT token. The `normalize_token_teams()` function in `mcpgateway/auth.py` is the **single source of truth** for interpreting JWT team claims.
+Token scoping is the mechanism that determines which resources a user can **see** based on the `teams` claim in their JWT token.
+
+**Key functions** in `mcpgateway/auth.py`:
+
+- `normalize_token_teams()` — The **single source of truth** for interpreting JWT team claims into a canonical form. Used directly by API tokens and legacy tokens.
+- `resolve_session_teams()` — The **single policy point** for session-token team resolution. Teams are always resolved from the database first so that revoked memberships take effect immediately. If the JWT carries a non-empty `teams` claim, the result is narrowed to the intersection of DB teams and JWT teams — letting callers scope a session to a subset of their memberships without risking stale grants. If the intersection is empty (e.g. all JWT-claimed teams have been revoked), an empty list is returned, which demotes the session to public-only scope — the user can still access public resources and their own private resources, but loses access to all team-scoped resources. An explicit `teams: []` (empty list) in the JWT is treated as "no restriction requested" and returns the full DB membership — this intentionally differs from `normalize_token_teams` where `[] → public-only`. If `email` is `None` or empty, returns `[]` (public-only) — an identity-less session token never receives admin bypass.
+- `_narrow_by_jwt_teams()` — Shared intersection logic used by `resolve_session_teams`.
+- API tokens and legacy tokens always use `normalize_token_teams()` directly.
 
 ### Secure-First Defaults
 
 The token scoping system follows a **secure-first design principle**: when in doubt, access is restricted.
+
+#### API Tokens and Legacy Tokens
+
+These use `normalize_token_teams()` directly — the JWT `teams` claim is the sole authority:
 
 | JWT `teams` State | `is_admin` | Result | Access Level |
 |-------------------|------------|--------|--------------|
@@ -325,8 +339,24 @@ The token scoping system follows a **secure-first design principle**: when in do
 | Key `[]` (empty) | any | `[]` | PUBLIC-ONLY |
 | Key `["t1", "t2"]` | any | `["t1", "t2"]` | TEAM-SCOPED |
 
+#### Session Tokens
+
+Session tokens use `resolve_session_teams()` — the **database** is the authority, and the JWT `teams` claim only narrows (never broadens) the result:
+
+| JWT `teams` State | DB Teams | Result | Access Level |
+|-------------------|----------|--------|--------------|
+| Key MISSING | `["t1", "t2"]` | `["t1", "t2"]` | Full DB membership |
+| Key `null` | `["t1", "t2"]` | `["t1", "t2"]` | Full DB membership |
+| Key `[]` (empty) | `["t1", "t2"]` | `["t1", "t2"]` | Full DB membership (no restriction requested) |
+| Key `["t1"]` | `["t1", "t2"]` | `["t1"]` | Narrowed to intersection |
+| Key `["revoked"]` | `["t1", "t2"]` | `[]` | Empty intersection — public-only (fail-closed) |
+| any | `None` (admin) | `None` | ADMIN BYPASS (DB authority) |
+
 !!! warning "Critical Security Behavior"
-    A **missing** `teams` key always results in public-only access, even for admin users. Admin bypass requires **explicit** `teams: null` combined with `is_admin: true`.
+    A **missing** `teams` key always results in public-only access for API/legacy tokens, even for admin users. Admin bypass requires **explicit** `teams: null` combined with `is_admin: true`.
+
+!!! note "Session Token Membership Staleness"
+    Session tokens skip the `_check_team_membership` re-validation in the token scoping middleware because `resolve_session_teams()` already resolved membership from the database. Membership staleness is bounded by the `auth_cache` TTL. The cache stores the full DB membership (not the per-session narrowed intersection) so that multiple sessions for the same user narrow independently.
 
 ### Multi-Team Token Behavior
 
@@ -340,7 +370,7 @@ This means the first team in the token's teams array has special significance fo
 
 ### Return Value Semantics
 
-The `normalize_token_teams()` function returns:
+The `normalize_token_teams()` and `resolve_session_teams()` functions return:
 
 | Return Value | Meaning | Query Behavior |
 |--------------|---------|----------------|
@@ -352,7 +382,7 @@ The `normalize_token_teams()` function returns:
 
 ## Two-Layer Security Model
 
-MCP Gateway implements two distinct security layers that work together:
+ContextForge implements two distinct security layers that work together:
 
 ### Layer 1: Token Scoping (Data Filtering)
 
@@ -407,7 +437,7 @@ Request: POST /tools/{id}/execute
 | Admin UI | ✅ | ✅ | Permission-based rendering |
 | Service Layer | ✅ | N/A | Database query filtering |
 | WebSocket | ✅ | ✅ | Forwards auth to /rpc |
-| MCP Transport | ✅ | N/A | Streamable HTTP filtering |
+| MCP Transport | ✅ | N/A | Streamable HTTP filtering + per-server OAuth enforcement |
 
 ---
 
@@ -415,7 +445,7 @@ Request: POST /tools/{id}/execute
 
 ### Resource Architecture
 
-All resources in the MCP Gateway are scoped to teams with three visibility levels:
+All resources in ContextForge are scoped to teams with three visibility levels:
 
 ```mermaid
 flowchart TD
@@ -541,7 +571,7 @@ flowchart TD
 
 ## Role-Based Access Control (RBAC)
 
-The MCP Gateway implements a comprehensive RBAC system with four built-in roles that are automatically created during system bootstrap. These roles provide granular permission management across different scopes.
+ContextForge implements a comprehensive RBAC system with four built-in roles that are automatically created during system bootstrap. These roles provide granular permission management across different scopes.
 
 ### System Roles
 
@@ -722,7 +752,7 @@ sequenceDiagram
 
 ## Password Management
 
-MCP Gateway now supports:
+ContextForge now supports:
 
 - Self-service forgot-password/reset flow:
   - `POST /auth/email/forgot-password`
@@ -1094,13 +1124,18 @@ sequenceDiagram
 
 # Team Settings
 AUTO_CREATE_PERSONAL_TEAMS=true
-PERSONAL_TEAM_PREFIX=personal
+# PERSONAL_TEAM_PREFIX=personal  # optional: set to get collision-safe email-based slugs
 MAX_TEAMS_PER_USER=50
-MAX_MEMBERS_PER_TEAM=100
+MAX_MEMBERS_PER_TEAM=100        # platform admins are exempt from this cap
 
 # Team Invitation Settings
 INVITATION_EXPIRY_DAYS=7
 REQUIRE_EMAIL_VERIFICATION_FOR_INVITES=true
+
+# Team Governance
+ALLOW_TEAM_CREATION=true
+ALLOW_TEAM_JOIN_REQUESTS=true
+ALLOW_TEAM_INVITATIONS=true
 
 # Visibility
 # NOTE: Resources default to 'private' (not configurable via env today)
@@ -1207,13 +1242,13 @@ flowchart TD
 
 These behaviors are enforced consistently across all access paths:
 
-1. `normalize_token_teams()` is the ONLY function that interprets JWT team claims
-2. Missing `teams` key always returns `[]` (public-only, secure default)
-3. Admin bypass requires BOTH `teams: null` AND `is_admin: true`
-4. Empty teams list (`[]`) results in public-only access, even for admins
-5. All list endpoints pass `token_teams` to the service layer
-6. Service layer applies visibility filtering based on `token_teams`
-7. Public-only tokens can ONLY access `visibility='public'` resources
+1. `normalize_token_teams()` is the canonical interpreter of JWT team claims; `resolve_session_teams()` is the single policy point for session tokens (always DB-resolved)
+2. For API/legacy tokens: missing `teams` key always returns `[]` (public-only, secure default); empty `teams: []` also returns `[]`. For session tokens: missing, null, or empty `teams` returns the full DB membership (no narrowing requested)
+3. Admin bypass for API/legacy tokens requires BOTH `teams: null` AND `is_admin: true`; for session tokens, admin bypass is DB-derived (`is_admin` flag). In both cases the service layer requires `token_teams=None` AND `user_email=None` for unrestricted queries
+4. All list endpoints pass `token_teams` to the service layer
+5. Service layer applies visibility filtering based on `token_teams` via `BaseService._apply_access_control()`
+6. Public-only tokens can ONLY access `visibility='public'` resources — owner and team access are both suppressed
+7. Owner-based access (`owner_email`) grants visibility only for `visibility='private'` resources — it does not bypass team scoping for team-visibility resources
 
 ### Related Documentation
 

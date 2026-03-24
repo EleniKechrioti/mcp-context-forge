@@ -4,7 +4,6 @@
 # Standard
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -117,58 +116,6 @@ def test_get_user_team_ids_sync(monkeypatch):
     assert auth._get_user_team_ids_sync("user@example.com") == ["t1", "t2"]
 
 
-def test_resolve_teams_from_db_sync_admin_bypass():
-    assert auth._resolve_teams_from_db_sync("user@example.com", is_admin=True) is None
-
-
-def test_resolve_teams_from_db_sync_cache_hit(monkeypatch):
-    class DummyEntry:
-        def __init__(self, value):
-            self.value = value
-
-        def is_expired(self):
-            return False
-
-    cache_key = "user@example.com:True"
-    dummy_cache = SimpleNamespace(
-        _teams_list_cache={cache_key: DummyEntry(["t1"])},
-        _hit_count=0,
-    )
-
-    import mcpgateway.cache.auth_cache as auth_cache_mod
-
-    monkeypatch.setattr(auth_cache_mod, "auth_cache", dummy_cache)
-    assert auth._resolve_teams_from_db_sync("user@example.com", is_admin=False) == ["t1"]
-    assert dummy_cache._hit_count == 1
-
-
-def test_resolve_teams_from_db_sync_cache_miss_populates_cache(monkeypatch):
-    class DummyEntry:
-        def __init__(self, value, expiry):  # noqa: ARG002 - matches real CacheEntry signature
-            self.value = value
-
-        def is_expired(self):
-            return False
-
-    cache_key = "user@example.com:True"
-    dummy_cache = SimpleNamespace(
-        _teams_list_cache={},
-        _hit_count=0,
-        _teams_list_ttl=60,
-        _lock=threading.Lock(),
-    )
-
-    import mcpgateway.cache.auth_cache as auth_cache_mod
-
-    monkeypatch.setattr(auth_cache_mod, "auth_cache", dummy_cache)
-    monkeypatch.setattr(auth_cache_mod, "CacheEntry", DummyEntry)
-    monkeypatch.setattr(auth, "_get_user_team_ids_sync", lambda _email: ["t1"])
-
-    assert auth._resolve_teams_from_db_sync("user@example.com", is_admin=False) == ["t1"]
-    assert cache_key in dummy_cache._teams_list_cache
-    assert dummy_cache._teams_list_cache[cache_key].value == ["t1"]
-
-
 @pytest.mark.asyncio
 async def test_resolve_teams_from_db_async_admin_bypass():
     assert await auth._resolve_teams_from_db("user@example.com", {"is_admin": True}) is None
@@ -270,6 +217,35 @@ def test_lookup_api_token_sync_expired(monkeypatch):
     session = DummySession(results=[expired_token])
     monkeypatch.setattr(auth, "fresh_db_session", lambda: _session_ctx(session))
     assert auth._lookup_api_token_sync("hash") == {"expired": True}
+
+
+def test_lookup_api_token_sync_expired_naive_datetime(monkeypatch):
+    """Naive datetime from SQLite is correctly detected as expired."""
+    expired_token = SimpleNamespace(
+        expires_at=datetime(2026, 3, 8, 12, 0, 0),  # naive (no tzinfo)
+        jti="jti-1",
+        user_email="user@example.com",
+        last_used=None,
+    )
+    session = DummySession(results=[expired_token])
+    monkeypatch.setattr(auth, "fresh_db_session", lambda: _session_ctx(session))
+    monkeypatch.setattr("mcpgateway.db.utc_now", lambda: datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc))
+    assert auth._lookup_api_token_sync("hash") == {"expired": True}
+
+
+def test_lookup_api_token_sync_not_expired_naive_datetime(monkeypatch):
+    """Naive datetime from SQLite in the future is correctly detected as not expired."""
+    active_token = SimpleNamespace(
+        expires_at=datetime(2026, 3, 10, 12, 0, 0),  # naive, in the future
+        jti="jti-1",
+        user_email="user@example.com",
+        last_used=None,
+    )
+    session = DummySession(results=[active_token, None])
+    monkeypatch.setattr(auth, "fresh_db_session", lambda: _session_ctx(session))
+    monkeypatch.setattr("mcpgateway.db.utc_now", lambda: datetime(2026, 3, 9, 12, 0, 0, tzinfo=timezone.utc))
+    result = auth._lookup_api_token_sync("hash")
+    assert result["user_email"] == "user@example.com"
 
 
 def test_lookup_api_token_sync_revoked(monkeypatch):

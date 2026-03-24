@@ -7,11 +7,11 @@ This guide explains how to upload and manage custom CA certificate bundles for r
 
 ## Overview
 
-MCP Gateway supports connecting to servers with self-signed certificates by allowing administrators to upload custom CA certificate bundles. These certificates are stored securely in the database and used automatically when establishing HTTPS connections to the associated MCP server.
+ContextForge supports connecting to servers with self-signed certificates by allowing administrators to upload custom CA certificate bundles. These certificates are stored securely in the database and used automatically when establishing HTTPS connections to the associated MCP server.
 
 ## Prerequisites
 
--   You must have administrator access to the MCP Gateway.
+-   You must have administrator access to ContextForge.
 -   You need the root CA certificate file (or the full certificate chain) in PEM format. Supported file extensions are `.pem`, `.crt`, `.cer`, and `.cert`.
 -   Maximum file size: **10 MB per certificate file**.
 -   The certificates must be valid PEM-encoded X.509 certificates.
@@ -20,7 +20,7 @@ MCP Gateway supports connecting to servers with self-signed certificates by allo
 
 ### 1. Navigate to the Admin Panel
 
-Log in to the MCP Gateway and go to the **Admin** section.
+Log in to ContextForge and go to the **Admin** section.
 
 ### 2. Go to Gateways Tab
 
@@ -94,8 +94,10 @@ When the gateway invokes a tool from an MCP server with a custom CA certificate:
 1. **SSL Context Creation**: A custom SSL context is created using Python's `ssl.create_default_context()`
 2. **Certificate Loading**: The CA certificate is loaded using `ctx.load_verify_locations(cadata=ca_certificate)`
 3. **Signature Validation** (if enabled): The certificate signature is validated using Ed25519 to ensure it hasn't been tampered with
-4. **HTTPS Client Configuration**: The SSL context is passed to the HTTPX client as the `verify` parameter
+4. **mTLS client cert/key support**: If `client_cert` and `client_key` are configured for the gateway, the SSL context is loaded with `ctx.load_cert_chain(client_cert, client_key)` for mutual TLS
+5. **HTTPS Client Configuration**: The SSL context is passed to the HTTPX client as the `verify` parameter
 5. **Secure Connection**: All HTTPS requests to the MCP server use the custom CA certificate for validation
+6. **HTTP Bypass**: For plain `http://` gateway URLs, SSL context creation is skipped and default HTTPX verification is used for reduced overhead
 
 ### Usage During Gateway Registration
 
@@ -198,7 +200,7 @@ Handle complex scenarios:
 
 ## Example: Creating and Using a Self-Signed Certificate
 
-For testing purposes, here's how to create a self-signed certificate and use it with MCP Gateway:
+For testing purposes, here's how to create a self-signed certificate and use it with ContextForge:
 
 ### 1. Generate a Self-Signed Certificate
 
@@ -218,9 +220,9 @@ cp server-cert.pem ca-cert.pem
 ./mcp-server --cert server-cert.pem --key server-key.pem --port 8443
 ```
 
-### 3. Upload to MCP Gateway
+### 3. Upload to ContextForge
 
-1. In the MCP Gateway admin panel, go to **Gateways** → **Add Gateway**
+1. In ContextForge admin panel, go to **Gateways** → **Add Gateway**
 2. Enter the server URL: `https://mcp-server.local:8443`
 3. Upload the `ca-cert.pem` file in the CA Certificate section
 4. Save the gateway configuration

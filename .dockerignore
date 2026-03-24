@@ -251,6 +251,11 @@ mcpgateway/test_migration.db
 *.log
 logs/
 log/
+reports/
+coverage/
+artifacts/
+.tmp/
+tmp/
 
 # Certificates and secrets
 certs/
@@ -266,6 +271,9 @@ jwt/
 public/
 static/
 media/
+
+# Test harnesses (should not ship in container images)
+mcpgateway/static/iframe-test-harness.html
 
 # Application instances
 instance/
@@ -294,6 +302,7 @@ docs/build/
 
 # PyBuilder
 target/
+**/target/
 
 # Jupyter Notebook
 .ipynb_checkpoints

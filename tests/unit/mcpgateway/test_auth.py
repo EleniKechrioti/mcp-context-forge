@@ -231,32 +231,22 @@ class TestGetCurrentUser:
                 assert exc_info.value.detail == "Token has been revoked"
 
     @pytest.mark.asyncio
-    async def test_token_revocation_check_failure_logs_warning(self, caplog):
-        """Test that token revocation check failure logs warning but doesn't fail auth."""
+    async def test_token_revocation_check_failure_denies_access(self, caplog):
+        """Test that token revocation check failure denies access (fail-secure)."""
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="jwt_with_jti")
 
         jwt_payload = {"sub": "test@example.com", "jti": "token_id_456", "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()}
-
-        mock_user = EmailUser(
-            email="test@example.com",
-            password_hash="hash",
-            full_name="Test User",
-            is_admin=False,
-            is_active=True,
-            email_verified_at=datetime.now(timezone.utc),
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
 
         caplog.set_level(logging.WARNING)
 
         with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
             with patch("mcpgateway.auth._check_token_revoked_sync", side_effect=Exception("Database error")):
-                with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_user_by_email_sync", return_value=None):
                     with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
-                        user = await get_current_user(credentials=credentials)
+                        with pytest.raises(HTTPException) as exc_info:
+                            await get_current_user(credentials=credentials)
 
-                        assert user.email == mock_user.email
+                        assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
                         assert "Token revocation check failed for JTI token_id_456" in caplog.text
 
     @pytest.mark.asyncio
@@ -298,7 +288,220 @@ class TestGetCurrentUser:
 
                     assert user.email == mock_user.email
                     assert user.auth_provider == "api_token"
-                    assert user.password_change_required is False
+
+    @pytest.mark.asyncio
+    async def test_session_token_with_single_team_narrows_via_resolve_session_teams(self, monkeypatch):
+        """Session tokens with a JWT teams claim narrow DB teams via resolve_session_teams."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="session_jwt_token")
+
+        # JWT carries one team; DB has two — intersection narrows to one
+        jwt_payload = {
+            "sub": "test@example.com",
+            "token_use": "session",
+            "teams": ["team-123"],
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+            "jti": "session_jti_123",
+        }
+
+        cached_ctx = SimpleNamespace(
+            is_token_revoked=False,
+            user={"email": "test@example.com", "full_name": "Test User", "is_admin": False, "is_active": True},
+            personal_team_id="team_123",
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+        monkeypatch.setattr(settings, "auth_cache_enabled", True)
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.cache.auth_cache.auth_cache.get_auth_context", AsyncMock(return_value=cached_ctx)):
+                with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["team-123", "team-456"]) as mock_resolve_db:
+                    user = await get_current_user(credentials=credentials, request=request)
+
+                    assert user.email == "test@example.com"
+                    mock_resolve_db.assert_called_once()
+                    # JWT teams=["team-123"] intersected with DB=["team-123","team-456"]
+                    assert request.state.token_teams == ["team-123"]
+
+    @pytest.mark.asyncio
+    async def test_session_token_with_multiple_teams_resolves_from_db(self, monkeypatch):
+        """Test that session tokens with multiple teams resolve from DB (else branch of line 1056)."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="session_jwt_token")
+
+        # Session token with multiple teams
+        jwt_payload = {
+            "sub": "test@example.com",
+            "token_use": "session",
+            "teams": ["team-1", "team-2"],
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+            "jti": "session_jti_456",
+        }
+
+        # Mock cached context
+        cached_ctx = SimpleNamespace(
+            is_token_revoked=False,
+            user={"email": "test@example.com", "full_name": "Test User", "is_admin": False, "is_active": True},
+            personal_team_id="team_123",
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        # Enable auth cache
+        monkeypatch.setattr(settings, "auth_cache_enabled", True)
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.cache.auth_cache.auth_cache.get_auth_context", AsyncMock(return_value=cached_ctx)):
+                with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["db-team-1", "db-team-2"]) as mock_resolve_db:
+                    user = await get_current_user(credentials=credentials, request=request)
+
+                    assert user.email == "test@example.com"
+                    # Verify _resolve_teams_from_db WAS called
+                    mock_resolve_db.assert_called_once()
+                    # JWT teams ["team-1","team-2"] don't overlap with DB teams
+                    # ["db-team-1","db-team-2"], so intersection is empty →
+                    # returns [] (public-only, denied from team-scoped resources)
+                    assert request.state.token_teams == []
+
+    @pytest.mark.asyncio
+    async def test_session_token_with_teams_claim_still_resolves_from_db(self):
+        """Session tokens always resolve teams from DB even when a teams claim is present."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="session_jwt_with_teams")
+
+        # Session token with explicit single team claim — should still go to DB
+        jwt_payload = {
+            "sub": "test@example.com",
+            "token_use": "session",
+            "teams": ["team-123"],
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        }
+
+        mock_user = EmailUser(
+            email="test@example.com",
+            password_hash="hash",
+            full_name="Test User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["team-123"]) as mock_resolve_teams:
+                    with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                        user = await get_current_user(credentials=credentials)
+
+                        assert user.email == mock_user.email
+                        # Session tokens always resolve from DB for current membership
+                        mock_resolve_teams.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_session_token_without_teams_claim_resolves_from_db(self):
+        """Test that session tokens without 'teams' claim resolve teams from DB."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="session_jwt_no_teams")
+
+        # Session token WITHOUT teams claim
+        jwt_payload = {
+            "sub": "test@example.com",
+            "token_use": "session",
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        }
+
+        mock_user = EmailUser(
+            email="test@example.com",
+            password_hash="hash",
+            full_name="Test User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["db-team-1"]) as mock_resolve_teams:
+                    with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                        user = await get_current_user(credentials=credentials)
+
+                        # Verify user was authenticated
+                        assert user.email == mock_user.email
+
+                        # Verify _resolve_teams_from_db WAS called
+                        mock_resolve_teams.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_session_token_with_null_teams_claim_uses_db_resolve(self):
+        """Test that session tokens with teams=null use _resolve_teams_from_db (which returns None for admin)."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="session_jwt_null_teams")
+
+        # Session token with explicit null teams (admin bypass)
+        jwt_payload = {
+            "sub": "admin@example.com",
+            "token_use": "session",
+            "teams": None,
+            "is_admin": True,
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        }
+
+        mock_user = EmailUser(
+            email="admin@example.com",
+            password_hash="hash",
+            full_name="Admin User",
+            is_admin=True,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._resolve_teams_from_db", return_value=None) as mock_resolve_teams:
+                    with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                        user = await get_current_user(credentials=credentials)
+
+                        # Verify user was authenticated
+                        assert user.email == mock_user.email
+
+                        # Verify _resolve_teams_from_db WAS called (teams=null is not a list with len==1)
+                        mock_resolve_teams.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_api_token_always_uses_embedded_teams(self):
+        """Test that API tokens always use embedded teams regardless of teams claim."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="api_jwt_token")
+
+        # API token (not session)
+        jwt_payload = {
+            "sub": "api@example.com",
+            "token_use": "api",
+            "teams": ["api-team-1"],
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        }
+
+        mock_user = EmailUser(
+            email="api@example.com",
+            password_hash="hash",
+            full_name="API User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._resolve_teams_from_db") as mock_resolve_teams:
+                    with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                        user = await get_current_user(credentials=credentials)
+
+                        # Verify user was authenticated
+                        assert user.email == mock_user.email
+
+                        # Verify _resolve_teams_from_db was NOT called (API tokens use embedded teams)
+                        mock_resolve_teams.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_expired_api_token_raises_401(self):
@@ -529,9 +732,40 @@ class TestGetCurrentUser:
                     assert exc_info.value.detail == "Account disabled"
 
     @pytest.mark.asyncio
-    async def test_logging_debug_messages(self, caplog):
+    async def test_logging_debug_messages(self, caplog, monkeypatch):
         """Test that appropriate debug messages are logged during authentication."""
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="test_token_for_logging")
+
+        jwt_payload = {"sub": "test@example.com", "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()}
+
+        mock_user = EmailUser(
+            email="test@example.com",
+            password_hash="hash",
+            full_name="Test User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        caplog.set_level(logging.DEBUG, logger="mcpgateway.auth")
+        monkeypatch.setattr(settings, "auth_cache_enabled", False)
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                    await get_current_user(credentials=credentials)
+
+                    assert "Attempting JWT token validation" in caplog.text
+                    assert "JWT token validated successfully" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_token_value_is_not_logged(self, caplog):
+        """Ensure raw bearer token material is never emitted to logs."""
+        raw_token = "super_secret_token_value_1234567890"
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=raw_token)
 
         jwt_payload = {"sub": "test@example.com", "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()}
 
@@ -553,8 +787,8 @@ class TestGetCurrentUser:
                 with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
                     await get_current_user(credentials=credentials)
 
-                    assert "Attempting JWT token validation" in caplog.text
-                    assert "JWT token validated successfully" in caplog.text
+        assert raw_token not in caplog.text
+        assert raw_token[:20] not in caplog.text
 
 
 class TestAuthHooksOptimization:
@@ -672,6 +906,777 @@ class TestAuthHooksOptimization:
 
                         # Verify user was authenticated via standard JWT path
                         assert user.email == mock_user.email
+
+
+class TestGetSyncRedisClient:
+    """Test cases for _get_sync_redis_client helper function."""
+
+    def test_get_sync_redis_client_returns_cached_client(self):
+        """Test that _get_sync_redis_client returns cached client if already initialized."""
+        # First-Party
+        from mcpgateway import auth
+
+        # Set up a mock cached client
+        mock_redis = MagicMock()
+        auth._SYNC_REDIS_CLIENT = mock_redis
+
+        try:
+            result = auth._get_sync_redis_client()
+            assert result is mock_redis
+        finally:
+            # Clean up
+            auth._SYNC_REDIS_CLIENT = None
+
+    def test_get_sync_redis_client_returns_none_when_redis_not_configured(self):
+        """Test that _get_sync_redis_client returns None when Redis is not configured."""
+        # First-Party
+        from mcpgateway import auth
+
+        # Reset cached client
+        auth._SYNC_REDIS_CLIENT = None
+
+        with patch("mcpgateway.config.settings") as mock_settings:
+            mock_settings.redis_url = ""
+            mock_settings.cache_type = "redis"
+
+            result = auth._get_sync_redis_client()
+            assert result is None
+
+    def test_get_sync_redis_client_returns_none_when_cache_type_not_redis(self):
+        """Test that _get_sync_redis_client returns None when cache_type is not redis."""
+        # First-Party
+        from mcpgateway import auth
+
+        # Reset cached client
+        auth._SYNC_REDIS_CLIENT = None
+
+        with patch("mcpgateway.config.settings") as mock_settings:
+            mock_settings.redis_url = "redis://localhost:6379/0"
+            mock_settings.cache_type = "memory"
+
+            result = auth._get_sync_redis_client()
+            assert result is None
+
+    def test_get_sync_redis_client_initializes_on_first_call(self):
+        """Test that _get_sync_redis_client initializes Redis client on first call."""
+        # Standard
+        import sys
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Reset cached client
+        original_client = auth._SYNC_REDIS_CLIENT
+        auth._SYNC_REDIS_CLIENT = None
+
+        try:
+            mock_redis_client = MagicMock()
+            mock_redis_client.ping.return_value = True
+
+            # Mock the redis module
+            mock_redis_module = MagicMock()
+            mock_redis_module.from_url.return_value = mock_redis_client
+
+            with patch("mcpgateway.config.settings") as mock_settings, patch.dict(sys.modules, {"redis": mock_redis_module}):
+                mock_settings.redis_url = "redis://localhost:6379/0"
+                mock_settings.cache_type = "redis"
+
+                result = auth._get_sync_redis_client()
+
+                mock_redis_module.from_url.assert_called_once()
+                mock_redis_client.ping.assert_called_once()
+                assert result is mock_redis_client
+                # Verify it's cached
+                assert auth._SYNC_REDIS_CLIENT is mock_redis_client
+        finally:
+            # Restore original state
+            auth._SYNC_REDIS_CLIENT = original_client
+
+    def test_get_sync_redis_client_handles_redis_connection_failure(self):
+        """Test that _get_sync_redis_client handles Redis connection failure gracefully."""
+        # Standard
+        import sys
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Reset cached client
+        original_client = auth._SYNC_REDIS_CLIENT
+        auth._SYNC_REDIS_CLIENT = None
+
+        try:
+            # Mock the redis module to raise an exception
+            mock_redis_module = MagicMock()
+            mock_redis_module.from_url.side_effect = Exception("Connection failed")
+
+            with patch("mcpgateway.config.settings") as mock_settings, patch.dict(sys.modules, {"redis": mock_redis_module}):
+                mock_settings.redis_url = "redis://localhost:6379/0"
+                mock_settings.cache_type = "redis"
+
+                result = auth._get_sync_redis_client()
+
+                assert result is None
+                # Verify None is cached
+                assert auth._SYNC_REDIS_CLIENT is None
+        finally:
+            # Restore original state
+            auth._SYNC_REDIS_CLIENT = original_client
+
+    def test_get_sync_redis_client_handles_redis_ping_failure(self):
+        """Test that _get_sync_redis_client handles Redis ping failure gracefully."""
+        # Standard
+        import sys
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Reset cached client
+        original_client = auth._SYNC_REDIS_CLIENT
+        auth._SYNC_REDIS_CLIENT = None
+
+        try:
+            mock_redis_client = MagicMock()
+            mock_redis_client.ping.side_effect = Exception("Ping failed")
+
+            # Mock the redis module
+            mock_redis_module = MagicMock()
+            mock_redis_module.from_url.return_value = mock_redis_client
+
+            with patch("mcpgateway.config.settings") as mock_settings, patch.dict(sys.modules, {"redis": mock_redis_module}):
+                mock_settings.redis_url = "redis://localhost:6379/0"
+                mock_settings.cache_type = "redis"
+
+                result = auth._get_sync_redis_client()
+
+                assert result is None
+                # Verify None is cached
+                assert auth._SYNC_REDIS_CLIENT is None
+        finally:
+            # Restore original state
+            auth._SYNC_REDIS_CLIENT = original_client
+
+    def test_get_sync_redis_client_double_check_locking(self):
+        """Test that _get_sync_redis_client properly handles double-check locking."""
+        # Standard
+        import sys
+        import threading
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Reset cached client
+        original_client = auth._SYNC_REDIS_CLIENT
+        auth._SYNC_REDIS_CLIENT = None
+
+        try:
+            mock_redis_client = MagicMock()
+            mock_redis_client.ping.return_value = True
+
+            call_count = 0
+
+            def mock_from_url_with_delay(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                # Simulate initialization delay
+                # Standard
+                import time
+
+                time.sleep(0.01)
+                return mock_redis_client
+
+            # Mock the redis module
+            mock_redis_module = MagicMock()
+            mock_redis_module.from_url.side_effect = mock_from_url_with_delay
+
+            with patch("mcpgateway.config.settings") as mock_settings, patch.dict(sys.modules, {"redis": mock_redis_module}):
+                mock_settings.redis_url = "redis://localhost:6379/0"
+                mock_settings.cache_type = "redis"
+
+                # Call from multiple threads simultaneously
+                results = []
+
+                def call_get_sync():
+                    results.append(auth._get_sync_redis_client())
+
+                threads = [threading.Thread(target=call_get_sync) for _ in range(5)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+                # Should only initialize once despite multiple concurrent calls
+                assert call_count <= 1  # May be 0 if already cached or 1 if initialized
+                # All threads should get the same instance (or None if uninitialized)
+                assert all(r == results[0] for r in results)
+        finally:
+            # Restore original state
+            auth._SYNC_REDIS_CLIENT = original_client
+
+    def test_get_sync_redis_client_backoff_after_failure(self):
+        """Test that _get_sync_redis_client backs off for 30s after a failure."""
+        # Standard
+        import sys
+        import time as time_module
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Save and reset state
+        original_client = auth._SYNC_REDIS_CLIENT
+        original_failure_time = auth._SYNC_REDIS_FAILURE_TIME
+        auth._SYNC_REDIS_CLIENT = None
+        auth._SYNC_REDIS_FAILURE_TIME = None
+
+        try:
+            mock_redis_module = MagicMock()
+            mock_redis_module.from_url.side_effect = Exception("Connection refused")
+
+            with patch("mcpgateway.config.settings") as mock_settings, patch.dict(sys.modules, {"redis": mock_redis_module}):
+                mock_settings.redis_url = "redis://localhost:6379/0"
+                mock_settings.cache_type = "redis"
+
+                # First call: should attempt connection and fail
+                result1 = auth._get_sync_redis_client()
+                assert result1 is None
+                assert auth._SYNC_REDIS_FAILURE_TIME is not None
+                mock_redis_module.from_url.assert_called_once()
+
+                # Second call within 30s: should skip retry due to backoff
+                mock_redis_module.from_url.reset_mock()
+                result2 = auth._get_sync_redis_client()
+                assert result2 is None
+                mock_redis_module.from_url.assert_not_called()
+
+                # Simulate 31 seconds passing
+                auth._SYNC_REDIS_FAILURE_TIME = time_module.time() - 31
+
+                # Third call after backoff: should retry
+                mock_redis_module.from_url.reset_mock()
+                mock_redis_module.from_url.side_effect = Exception("Still down")
+                result3 = auth._get_sync_redis_client()
+                assert result3 is None
+                mock_redis_module.from_url.assert_called_once()
+        finally:
+            auth._SYNC_REDIS_CLIENT = original_client
+            auth._SYNC_REDIS_FAILURE_TIME = original_failure_time
+
+
+class TestUpdateApiTokenLastUsed:
+    """Test cases for _update_api_token_last_used_sync helper function."""
+
+    def test_update_api_token_last_used_sync_updates_timestamp(self):
+        """Test that _update_api_token_last_used_sync updates last_used timestamp."""
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+        from mcpgateway.db import EmailApiToken
+
+        mock_api_token = MagicMock(spec=EmailApiToken)
+        mock_api_token.jti = "jti-123"
+        mock_api_token.last_used = None
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = mock_api_token
+        mock_db.execute.return_value = mock_result
+
+        with patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session:
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+
+            with patch("mcpgateway.db.utc_now") as mock_utc_now:
+                mock_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+                mock_utc_now.return_value = mock_time
+
+                _update_api_token_last_used_sync("jti-123")
+
+                # Verify last_used was updated
+                assert mock_api_token.last_used == mock_time
+                mock_db.commit.assert_called_once()
+
+    def test_update_api_token_last_used_sync_handles_missing_token(self):
+        """Test that _update_api_token_last_used_sync handles missing token gracefully."""
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None  # Token not found
+        mock_db.execute.return_value = mock_result
+
+        with patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session:
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+
+            # Should not raise exception
+            _update_api_token_last_used_sync("jti-nonexistent")
+
+            # Should not commit if token not found
+            mock_db.commit.assert_not_called()
+
+    def test_update_api_token_last_used_sync_rate_limits_with_redis(self):
+        """Test that _update_api_token_last_used_sync rate-limits updates using Redis."""
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+
+        mock_redis_client = MagicMock()
+        mock_redis_client.get.return_value = "1234567890.0"  # Last update timestamp
+
+        with (
+            patch("mcpgateway.auth._get_sync_redis_client", return_value=mock_redis_client),
+            patch("mcpgateway.auth.settings") as mock_settings,
+            patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session,
+            patch("time.time", return_value=1234567890.0),
+        ):  # Same time (no elapsed time)
+            mock_settings.token_last_used_update_interval_minutes = 5
+
+            _update_api_token_last_used_sync("jti-123")
+
+            # Should skip DB update due to rate limiting
+            mock_fresh_session.assert_not_called()
+            mock_redis_client.get.assert_called_once_with("api_token_last_used:jti-123")
+
+    def test_update_api_token_last_used_sync_updates_after_interval(self):
+        """Test that _update_api_token_last_used_sync updates after rate-limit interval."""
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+        from mcpgateway.db import EmailApiToken
+
+        mock_api_token = MagicMock(spec=EmailApiToken)
+        mock_api_token.jti = "jti-123"
+        mock_api_token.last_used = None
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = mock_api_token
+        mock_db.execute.return_value = mock_result
+
+        mock_redis_client = MagicMock()
+        # Last update was 400 seconds ago (> 5 minutes)
+        mock_redis_client.get.return_value = "1234567490.0"
+
+        with (
+            patch("mcpgateway.auth._get_sync_redis_client", return_value=mock_redis_client),
+            patch("mcpgateway.auth.settings") as mock_settings,
+            patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session,
+            patch("time.time", return_value=1234567890.0),
+            patch("mcpgateway.db.utc_now") as mock_utc_now,
+        ):
+            mock_settings.token_last_used_update_interval_minutes = 5
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+            mock_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+            mock_utc_now.return_value = mock_time
+
+            _update_api_token_last_used_sync("jti-123")
+
+            # Should update DB after rate-limit interval
+            mock_fresh_session.assert_called_once()
+            mock_db.commit.assert_called_once()
+            assert mock_api_token.last_used == mock_time
+            # Should update Redis cache
+            mock_redis_client.setex.assert_called_once()
+
+    def test_update_api_token_last_used_sync_falls_back_to_memory_cache(self):
+        """Test that _update_api_token_last_used_sync falls back to in-memory cache when Redis unavailable."""
+        # Standard
+        import sys
+
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+        from mcpgateway.db import EmailApiToken
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Clear the module-level in-memory cache
+        auth._LAST_USED_CACHE.clear()
+
+        mock_api_token = MagicMock(spec=EmailApiToken)
+        mock_api_token.jti = "jti-fallback-123"
+        mock_api_token.last_used = None
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = mock_api_token
+        mock_db.execute.return_value = mock_result
+
+        # Mock the redis module to raise an exception
+        mock_redis_module = MagicMock()
+        mock_redis_module.from_url.side_effect = Exception("Redis unavailable")
+
+        with (
+            patch("mcpgateway.auth.settings") as mock_settings,
+            patch.dict(sys.modules, {"redis": mock_redis_module}),
+            patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session,
+            patch("time.time", return_value=1234567890.0),
+            patch("mcpgateway.db.utc_now") as mock_utc_now,
+        ):
+            mock_settings.redis_url = "redis://localhost:6379/0"
+            mock_settings.cache_type = "redis"
+            mock_settings.token_last_used_update_interval_minutes = 5
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+            mock_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+            mock_utc_now.return_value = mock_time
+
+            # First call should update
+            _update_api_token_last_used_sync("jti-fallback-123")
+            mock_db.commit.assert_called_once()
+            assert mock_api_token.last_used == mock_time
+
+            # Second call immediately after should be rate-limited
+            mock_db.reset_mock()
+            _update_api_token_last_used_sync("jti-fallback-123")
+            mock_db.commit.assert_not_called()
+
+    def test_update_api_token_last_used_sync_redis_exception_falls_back_to_memory(self):
+        """Test that _update_api_token_last_used_sync falls back to memory cache when Redis operations fail."""
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+        from mcpgateway.db import EmailApiToken
+
+        # First-Party
+        from mcpgateway import auth
+
+        # Clear the module-level in-memory cache
+        auth._LAST_USED_CACHE.clear()
+
+        mock_api_token = MagicMock(spec=EmailApiToken)
+        mock_api_token.jti = "jti-redis-error-123"
+        mock_api_token.last_used = None
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = mock_api_token
+        mock_db.execute.return_value = mock_result
+
+        # Mock a Redis client that exists but throws exceptions on operations
+        mock_redis_client = MagicMock()
+        mock_redis_client.get.side_effect = Exception("Redis get failed")
+
+        with (
+            patch("mcpgateway.auth.settings") as mock_settings,
+            patch("mcpgateway.auth._get_sync_redis_client", return_value=mock_redis_client),
+            patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session,
+            patch("time.time", return_value=1234567890.0),
+            patch("mcpgateway.db.utc_now") as mock_utc_now,
+        ):
+            mock_settings.token_last_used_update_interval_minutes = 5
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+            mock_time = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+            mock_utc_now.return_value = mock_time
+
+            # Should fall back to in-memory cache when Redis get fails
+            _update_api_token_last_used_sync("jti-redis-error-123")
+
+            # Verify Redis was attempted
+            mock_redis_client.get.assert_called()
+            # Verify DB update still occurred via fallback
+            mock_db.commit.assert_called_once()
+            assert mock_api_token.last_used == mock_time
+
+    @pytest.mark.asyncio
+    async def test_api_token_last_used_updated_on_jwt_auth(self, monkeypatch):
+        """Test that last_used is updated when API token is authenticated via JWT."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="api_token_jwt")
+
+        jwt_payload = {
+            "sub": "api@example.com",
+            "jti": "jti-api-456",
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+            "user": {"auth_provider": "api_token"},
+        }
+
+        mock_user = EmailUser(
+            email="api@example.com",
+            password_hash="hash",
+            full_name="API User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        # Disable batch queries to use the standard code path that's already mocked
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                    with patch("mcpgateway.auth._update_api_token_last_used_sync") as mock_update:
+                        with patch("mcpgateway.auth._check_token_revoked_sync", return_value=False):
+                            with patch("mcpgateway.auth.asyncio.to_thread", AsyncMock(side_effect=lambda f, *args: f(*args))):
+                                user = await get_current_user(credentials=credentials, request=request)
+
+                                # Verify user was authenticated
+                                assert user.email == "api@example.com"
+
+                                # Verify auth_method was set to api_token
+                                assert request.state.auth_method == "api_token"
+
+                                # Verify JTI was stored in request.state
+                                assert request.state.jti == "jti-api-456"
+
+                                # Verify last_used update was called
+                                mock_update.assert_called_once_with("jti-api-456")
+
+    @pytest.mark.asyncio
+    async def test_api_token_last_used_update_failure_continues_auth(self, monkeypatch):
+        """Test that authentication continues even if last_used update fails (lines 711-712)."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="api_token_jwt")
+
+        jwt_payload = {
+            "sub": "api@example.com",
+            "jti": "jti-api-fail-123",
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+            "user": {"auth_provider": "api_token"},
+        }
+
+        mock_user = EmailUser(
+            email="api@example.com",
+            password_hash="hash",
+            full_name="API User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        # Disable batch queries to use the standard code path that's already mocked
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        # Mock the update function to raise an exception
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                    with patch("mcpgateway.auth._check_token_revoked_sync", return_value=False):
+                        with patch("mcpgateway.auth._update_api_token_last_used_sync", side_effect=Exception("DB connection failed")):
+                            with patch("mcpgateway.auth.asyncio.to_thread", AsyncMock(side_effect=lambda f, *args: f(*args))):
+                                # Authentication should succeed despite update failure
+                                user = await get_current_user(credentials=credentials, request=request)
+
+                                # Verify user was authenticated
+                                assert user.email == "api@example.com"
+
+                                # Verify auth_method was still set to api_token
+                                assert request.state.auth_method == "api_token"
+
+    @pytest.mark.asyncio
+    async def test_api_token_jti_stored_in_request_state(self, monkeypatch):
+        """Test that JTI is stored in request.state for middleware use."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="jwt_with_jti")
+
+        jwt_payload = {
+            "sub": "test@example.com",
+            "jti": "jti-store-test-789",
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+            "user": {
+                "email": "test@example.com",
+                "auth_provider": "email",
+            },
+        }
+
+        mock_user = EmailUser(
+            email="test@example.com",
+            password_hash="hash",
+            full_name="Test User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        # Disable batch queries to use the standard code path that's already mocked
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_personal_team_sync", return_value="team_123"):
+                    with patch("mcpgateway.auth._check_token_revoked_sync", return_value=False):
+                        user = await get_current_user(credentials=credentials, request=request)
+
+                        # Verify user was authenticated
+                        assert user.email == "test@example.com"
+
+                        # Verify JTI was stored in request.state
+                        assert hasattr(request.state, "jti")
+                        assert request.state.jti == "jti-store-test-789"
+
+    @pytest.mark.asyncio
+    async def test_legacy_api_token_last_used_updated(self, monkeypatch):
+        """Test that last_used is updated for legacy API tokens (DB lookup path)."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="legacy_api_token")
+
+        # JWT payload without auth_provider (legacy format)
+        jwt_payload = {
+            "sub": "legacy@example.com",
+            "jti": "jti-legacy-999",
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        }
+
+        mock_user = EmailUser(
+            email="legacy@example.com",
+            password_hash="hash",
+            full_name="Legacy User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        # Disable batch queries to use the standard code path that's already mocked
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                    with patch("mcpgateway.auth._is_api_token_jti_sync", return_value=True):
+                        with patch("mcpgateway.auth._update_api_token_last_used_sync") as mock_update:
+                            with patch("mcpgateway.auth._check_token_revoked_sync", return_value=False):
+                                with patch("mcpgateway.auth.asyncio.to_thread", AsyncMock(side_effect=lambda f, *args: f(*args))):
+                                    user = await get_current_user(credentials=credentials, request=request)
+
+                                    # Verify user was authenticated
+                                    assert user.email == "legacy@example.com"
+
+                                    # Verify auth_method was set to api_token
+                                    assert request.state.auth_method == "api_token"
+
+                                    # Verify last_used update was called for legacy token
+                                    assert mock_update.call_count == 1
+                                    mock_update.assert_called_with("jti-legacy-999")
+
+    @pytest.mark.asyncio
+    async def test_legacy_api_token_last_used_update_failure_continues_auth(self, monkeypatch):
+        """Test that authentication continues even if legacy token last_used update fails (lines 732-733)."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="legacy_api_token")
+
+        # JWT payload without auth_provider (legacy format)
+        jwt_payload = {
+            "sub": "legacy@example.com",
+            "jti": "jti-legacy-fail-888",
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp(),
+        }
+
+        mock_user = EmailUser(
+            email="legacy@example.com",
+            password_hash="hash",
+            full_name="Legacy User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        # Disable batch queries to use the standard code path that's already mocked
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        # Mock functions individually
+        with patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=jwt_payload)):
+            with patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user):
+                with patch("mcpgateway.auth._get_personal_team_sync", return_value=None):
+                    with patch("mcpgateway.auth._check_token_revoked_sync", return_value=False):
+                        with patch("mcpgateway.auth._is_api_token_jti_sync", return_value=True):
+                            with patch("mcpgateway.auth._update_api_token_last_used_sync", side_effect=Exception("DB update failed")):
+                                with patch("mcpgateway.auth.asyncio.to_thread", AsyncMock(side_effect=lambda f, *args: f(*args))):
+                                    # Authentication should succeed despite update failure
+                                    user = await get_current_user(credentials=credentials, request=request)
+
+                                    # Verify user was authenticated
+                                    assert user.email == "legacy@example.com"
+
+                                    # Verify auth_method was still set to api_token
+                                    assert request.state.auth_method == "api_token"
+
+                                    # Verify JTI was stored in request.state
+                                    assert request.state.jti == "jti-legacy-fail-888"
+
+    def test_update_api_token_last_used_sync_evicts_old_cache_entries(self):
+        """Test that in-memory cache evicts oldest entries when max size is reached."""
+        # First-Party
+        from mcpgateway import auth
+        from mcpgateway.auth import _update_api_token_last_used_sync
+        from mcpgateway.db import EmailApiToken
+
+        # Clear the module-level cache
+        auth._LAST_USED_CACHE.clear()
+
+        mock_api_token = MagicMock(spec=EmailApiToken)
+        mock_api_token.jti = "jti-evict"
+        mock_api_token.last_used = None
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = mock_api_token
+        mock_db.execute.return_value = mock_result
+
+        # Pre-fill cache to _MAX_CACHE_SIZE (1024) entries
+        base_time = 1000000.0
+        for i in range(1024):
+            auth._LAST_USED_CACHE[f"jti-old-{i}"] = base_time + i
+
+        assert len(auth._LAST_USED_CACHE) == 1024
+
+        with (
+            patch("mcpgateway.auth._get_sync_redis_client", return_value=None),
+            patch("mcpgateway.auth.settings") as mock_settings,
+            patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session,
+            patch("time.time", return_value=base_time + 2000),
+            patch("mcpgateway.db.utc_now") as mock_utc_now,
+        ):
+            mock_settings.token_last_used_update_interval_minutes = 5
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+            mock_utc_now.return_value = datetime(2026, 2, 3, 12, 0, 0, tzinfo=timezone.utc)
+
+            _update_api_token_last_used_sync("jti-evict")
+
+        # Cache should have been evicted to ~512 + the new entry
+        assert len(auth._LAST_USED_CACHE) <= 513
+        assert "jti-evict" in auth._LAST_USED_CACHE
+        # Oldest entries (lower indices) should have been evicted
+        assert "jti-old-0" not in auth._LAST_USED_CACHE
+        # Newer entries should remain
+        assert "jti-old-1023" in auth._LAST_USED_CACHE
+
+    def test_update_api_token_last_used_sync_no_jti_in_api_token(self):
+        """Test that _set_auth_method_from_payload handles api_token without JTI."""
+        # This tests the branch where auth_provider == "api_token" but no JTI is present
+        # First-Party
+        from mcpgateway.auth import _update_api_token_last_used_sync
+
+        mock_db = MagicMock()
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None
+        mock_db.execute.return_value = mock_result
+
+        with patch("mcpgateway.auth._get_sync_redis_client", return_value=None), patch("mcpgateway.auth.settings") as mock_settings, patch("mcpgateway.auth.fresh_db_session") as mock_fresh_session:
+            mock_settings.token_last_used_update_interval_minutes = 5
+            mock_fresh_session.return_value.__enter__.return_value = mock_db
+            mock_fresh_session.return_value.__exit__.return_value = None
+
+            # Should not raise when token not found
+            _update_api_token_last_used_sync("jti-nonexistent-xyz")
+
+            # DB was queried but no commit since token not found
+            mock_db.execute.assert_called_once()
+            mock_db.commit.assert_not_called()
 
 
 # ============================================================================
@@ -873,6 +1878,7 @@ class TestSetAuthMethodFromPayload:
     @pytest.fixture(autouse=True)
     def disable_auth_cache(self, monkeypatch):
         monkeypatch.setattr(settings, "auth_cache_enabled", False)
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
 
     @pytest.mark.asyncio
     async def test_api_token_auth_provider(self):
@@ -899,6 +1905,8 @@ class TestSetAuthMethodFromPayload:
 
         with (
             patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=payload)),
+            patch("mcpgateway.auth._check_token_revoked_sync", return_value=False),
+            patch("mcpgateway.auth._update_api_token_last_used_sync", return_value=None),
             patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user),
             patch("mcpgateway.auth._get_personal_team_sync", return_value=None),
         ):
@@ -929,7 +1937,9 @@ class TestSetAuthMethodFromPayload:
 
         with (
             patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=payload)),
+            patch("mcpgateway.auth._check_token_revoked_sync", return_value=False),
             patch("mcpgateway.auth._is_api_token_jti_sync", return_value=True),
+            patch("mcpgateway.auth._update_api_token_last_used_sync", return_value=None),
             patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user),
             patch("mcpgateway.auth._get_personal_team_sync", return_value=None),
         ):
@@ -963,6 +1973,7 @@ class TestSetAuthMethodFromPayload:
             patch("mcpgateway.auth._is_api_token_jti_sync", return_value=False),
             patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user),
             patch("mcpgateway.auth._get_personal_team_sync", return_value=None),
+            patch("mcpgateway.auth._check_token_revoked_sync", return_value=False),
         ):
             user = await get_current_user(credentials=credentials, request=request)
 
@@ -1031,8 +2042,22 @@ class TestPluginAuthHook:
             metadata={"auth_method": "custom_sso"},
         )
         mock_pm.invoke_hook = AsyncMock(return_value=(plugin_result, {"ctx": "data"}))
+        db_user = EmailUser(
+            email="plugin@example.com",
+            password_hash="h",
+            full_name="Plugin User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
 
-        with patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm), patch("mcpgateway.auth.get_correlation_id", return_value="req-1"):
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=db_user),
+        ):
             user = await get_current_user(credentials=credentials, request=request)
 
         assert user.email == "plugin@example.com"
@@ -1318,6 +2343,7 @@ class TestCachePathBranches:
             patch("mcpgateway.cache.auth_cache.auth_cache.get_auth_context", AsyncMock(return_value=cached_ctx)),
             patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user),
             patch("mcpgateway.auth._get_personal_team_sync", return_value=None),
+            patch("mcpgateway.auth._check_token_revoked_sync", return_value=False),
         ):
             user = await get_current_user(credentials=credentials, request=request)
 
@@ -1341,6 +2367,7 @@ class TestCachePathBranches:
             patch("mcpgateway.cache.auth_cache.auth_cache.get_auth_context", AsyncMock(side_effect=RuntimeError("cache down"))),
             patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user),
             patch("mcpgateway.auth._get_personal_team_sync", return_value=None),
+            patch("mcpgateway.auth._check_token_revoked_sync", return_value=False),
         ):
             user = await get_current_user(credentials=credentials)
 
@@ -1663,6 +2690,43 @@ class TestFallbackPathWithRequest:
         assert request.state.team_id == "team-1"
         assert request.state.auth_method == "jwt"
 
+    @pytest.mark.asyncio
+    async def test_fallback_multi_team_api_token_does_not_set_single_team_id(self, monkeypatch):
+        """Multi-team API tokens should not collapse to a single request.state.team_id."""
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="jwt")
+        payload = {
+            "sub": "user@example.com",
+            "teams": ["team-1", "team-2"],
+            "token_use": "api",
+            "user": {"auth_provider": "local"},
+        }
+
+        mock_user = EmailUser(
+            email="user@example.com",
+            password_hash="h",
+            full_name="U",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        request = SimpleNamespace(state=SimpleNamespace())
+
+        monkeypatch.setattr(settings, "auth_cache_enabled", False)
+        monkeypatch.setattr(settings, "auth_cache_batch_queries", False)
+
+        with (
+            patch("mcpgateway.auth.verify_jwt_token_cached", AsyncMock(return_value=payload)),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=mock_user),
+            patch("mcpgateway.auth._get_personal_team_sync", return_value=None),
+        ):
+            await get_current_user(credentials=credentials, request=request)
+
+        assert request.state.token_teams == ["team-1", "team-2"]
+        assert request.state.team_id is None
+        assert request.state.token_use == "api"
+
 
 class TestApiTokenWithRequest:
     """Tests for API token fallback with request object."""
@@ -1817,11 +2881,22 @@ class TestPluginAuthHookEdgeCases:
             metadata=None,  # No metadata
         )
         mock_pm.invoke_hook = AsyncMock(return_value=(plugin_result, None))  # No context_table
+        db_user = EmailUser(
+            email="plugin@example.com",
+            password_hash="h",
+            full_name="Plugin User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
 
         with (
             patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
             patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
             patch("mcpgateway.auth._inject_userinfo_instate") as mock_inject,
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=db_user),
         ):
             user = await get_current_user(credentials=credentials, request=request)
 
@@ -1851,8 +2926,22 @@ class TestPluginAuthHookEdgeCases:
             metadata={"other_key": "value"},  # metadata present but no auth_method
         )
         mock_pm.invoke_hook = AsyncMock(return_value=(plugin_result, None))
+        db_user = EmailUser(
+            email="plugin@example.com",
+            password_hash="h",
+            full_name="Plugin User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
 
-        with patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm), patch("mcpgateway.auth.get_correlation_id", return_value="req-1"):
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=db_user),
+        ):
             user = await get_current_user(credentials=credentials, request=request)
 
         assert user.email == "plugin@example.com"
@@ -2029,41 +3118,6 @@ class TestGetUserTeamRoles:
 class TestResolveTeamsFromDbHelpers:
     """Targeted tests for small cache/DB helper branches in auth.py."""
 
-    def test_resolve_teams_from_db_sync_cache_read_exception(self, monkeypatch):
-        """Cache read errors are non-fatal and fall back to DB (lines 224-225)."""
-        # First-Party
-        from mcpgateway.auth import _resolve_teams_from_db_sync
-        from mcpgateway.cache.auth_cache import auth_cache
-
-        class BadGetDict(dict):
-            def get(self, *args, **kwargs):  # noqa: ANN002, ANN003 - test helper
-                raise RuntimeError("cache read fail")
-
-        monkeypatch.setattr(auth_cache, "_teams_list_cache", BadGetDict())
-
-        with patch("mcpgateway.auth._get_user_team_ids_sync", return_value=["t1"]):
-            assert _resolve_teams_from_db_sync("user@example.com", is_admin=False) == ["t1"]
-
-    def test_resolve_teams_from_db_sync_cache_write_exception(self, monkeypatch):
-        """Cache write errors are non-fatal and still return DB result (lines 243-244)."""
-        # First-Party
-        from mcpgateway.auth import _resolve_teams_from_db_sync
-        from mcpgateway.cache.auth_cache import auth_cache
-
-        class ExplodingLock:
-            def __enter__(self):  # noqa: ANN001 - test helper
-                raise RuntimeError("lock fail")
-
-            def __exit__(self, exc_type, exc, tb):  # noqa: ANN001 - test helper
-                return False
-
-        monkeypatch.setattr(auth_cache, "_lock", ExplodingLock())
-        # Ensure L1 cache is empty so we reach the write path
-        monkeypatch.setattr(auth_cache, "_teams_list_cache", {})
-
-        with patch("mcpgateway.auth._get_user_team_ids_sync", return_value=["t1"]):
-            assert _resolve_teams_from_db_sync("user@example.com", is_admin=False) == ["t1"]
-
     @pytest.mark.asyncio
     async def test_resolve_teams_from_db_cache_get_exception(self):
         """Async cache read errors are non-fatal and fall back to DB (lines 274-275)."""
@@ -2097,6 +3151,193 @@ class TestResolveTeamsFromDbHelpers:
         assert teams == ["t1"]
 
 
+class TestResolveSessionTeams:
+    """Direct tests for resolve_session_teams."""
+
+    @pytest.mark.asyncio
+    async def test_no_jwt_teams_returns_full_db_teams(self):
+        """Without a JWT teams claim, returns full DB membership."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com"}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["t1", "t2"]) as mock_db:
+            result = await resolve_session_teams(payload, "u@example.com", {"is_admin": False})
+
+        assert result == ["t1", "t2"]
+        mock_db.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_jwt_teams_narrows_to_intersection(self):
+        """JWT teams claim narrows result to intersection with DB teams."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com", "teams": ["t1"]}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["t1", "t2"]):
+            result = await resolve_session_teams(payload, "u@example.com", {"is_admin": False})
+
+        assert result == ["t1"]
+
+    @pytest.mark.asyncio
+    async def test_jwt_teams_all_revoked_returns_empty(self):
+        """If all JWT teams were revoked, returns empty list (public-only / denied)."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com", "teams": ["revoked-team"]}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["t1", "t2"]):
+            result = await resolve_session_teams(payload, "u@example.com", {"is_admin": False})
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_admin_bypass_ignores_jwt_teams(self):
+        """Admin bypass (None from DB) is returned regardless of JWT teams."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "admin@example.com", "teams": ["t1"]}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=None):
+            result = await resolve_session_teams(payload, "admin@example.com", {"is_admin": True})
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_db_teams_returns_empty(self):
+        """User with no DB teams returns empty list (public-only)."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com", "teams": ["t1"]}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=[]):
+            result = await resolve_session_teams(payload, "u@example.com", {"is_admin": False})
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_preresolved_db_teams_skips_db_call(self):
+        """When preresolved_db_teams is provided, skips the DB call."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com", "teams": ["t1"]}
+        with patch("mcpgateway.auth._resolve_teams_from_db") as mock_db:
+            result = await resolve_session_teams(
+                payload,
+                "u@example.com",
+                {"is_admin": False},
+                preresolved_db_teams=["t1", "t2"],
+            )
+
+        assert result == ["t1"]
+        mock_db.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_preresolved_none_returns_admin_bypass(self):
+        """Preresolved None (admin) returns None without DB call."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "admin@example.com"}
+        with patch("mcpgateway.auth._resolve_teams_from_db") as mock_db:
+            result = await resolve_session_teams(
+                payload,
+                "admin@example.com",
+                {"is_admin": True},
+                preresolved_db_teams=None,
+            )
+
+        assert result is None
+        mock_db.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_jwt_teams_null_returns_full_db_teams(self):
+        """Explicit teams: null in JWT is not a list, so no narrowing."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com", "teams": None}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["t1"]):
+            result = await resolve_session_teams(payload, "u@example.com", {"is_admin": False})
+
+        assert result == ["t1"]
+
+    @pytest.mark.asyncio
+    async def test_jwt_teams_empty_list_returns_full_db_teams(self):
+        """Explicit teams: [] in JWT is empty, so no narrowing."""
+        from mcpgateway.auth import resolve_session_teams
+
+        payload = {"sub": "u@example.com", "teams": []}
+        with patch("mcpgateway.auth._resolve_teams_from_db", return_value=["t1"]):
+            result = await resolve_session_teams(payload, "u@example.com", {"is_admin": False})
+
+        assert result == ["t1"]
+
+    @pytest.mark.asyncio
+    async def test_no_email_returns_public_only(self):
+        """Identity-less session token gets public-only scope, never admin bypass."""
+        from mcpgateway.auth import resolve_session_teams
+
+        # Even with is_admin=True, no email means no DB lookup and no admin bypass
+        assert await resolve_session_teams({"is_admin": True}, None, {"is_admin": True}) == []
+        assert await resolve_session_teams({"is_admin": True}, "", {"is_admin": True}) == []
+        assert await resolve_session_teams({}, None, {"is_admin": False}) == []
+
+
+class TestNarrowByJwtTeams:
+    """Direct unit tests for the _narrow_by_jwt_teams helper."""
+
+    def test_admin_bypass_passthrough(self):
+        """Admin bypass (db_teams=None) is returned unchanged regardless of JWT teams."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        assert _narrow_by_jwt_teams({"teams": ["t1"]}, None) is None
+        assert _narrow_by_jwt_teams({}, None) is None
+
+    def test_normal_intersection(self):
+        """Intersection of DB teams and JWT teams returns only the overlap."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        result = _narrow_by_jwt_teams({"teams": ["t1", "t3"]}, ["t1", "t2"])
+        assert result == ["t1"]
+
+    def test_empty_intersection(self):
+        """No overlap between JWT and DB teams returns empty list."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        result = _narrow_by_jwt_teams({"teams": ["gone"]}, ["t1", "t2"])
+        assert result == []
+
+    def test_empty_jwt_teams_no_narrowing(self):
+        """Explicit teams: [] means 'no restriction' — returns full DB teams."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        result = _narrow_by_jwt_teams({"teams": []}, ["t1", "t2"])
+        assert result == ["t1", "t2"]
+
+    def test_missing_jwt_teams_no_narrowing(self):
+        """Missing teams key means 'no restriction' — returns full DB teams."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        result = _narrow_by_jwt_teams({}, ["t1", "t2"])
+        assert result == ["t1", "t2"]
+
+    def test_null_jwt_teams_no_narrowing(self):
+        """Explicit teams: null is not a list — returns full DB teams."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        result = _narrow_by_jwt_teams({"teams": None}, ["t1"])
+        assert result == ["t1"]
+
+    def test_malformed_entries_filtered_by_normalize(self):
+        """Non-string entries in JWT teams are handled by normalize_token_teams."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        # normalize_token_teams stringifies numeric entries
+        result = _narrow_by_jwt_teams({"teams": [123, None, "t1"]}, ["t1", "123"])
+        assert "t1" in result
+
+    def test_empty_db_teams_returns_empty(self):
+        """If user has no DB teams, intersection with any JWT teams is empty."""
+        from mcpgateway.auth import _narrow_by_jwt_teams
+
+        result = _narrow_by_jwt_teams({"teams": ["t1"]}, [])
+        assert result == []
+
+
 class TestSessionTokenBranches:
     """Hit token_use='session' branches that weren't exercised by existing tests."""
 
@@ -2121,11 +3362,182 @@ class TestSessionTokenBranches:
                 None,
             )
         )
+        db_user = EmailUser(
+            email="plugin@example.com",
+            password_hash="h",
+            full_name="Plugin User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
 
-        with patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm), patch("mcpgateway.auth.get_correlation_id", return_value="req-1"):
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=db_user),
+        ):
             user = await get_current_user(credentials=credentials, request=None)
 
         assert user.email == "plugin@example.com"
+
+    @pytest.mark.asyncio
+    async def test_plugin_auth_ignores_plugin_admin_claim_and_uses_db_user(self):
+        """Plugin-provided is_admin must not override database admin status."""
+        # First-Party
+        from mcpgateway.plugins.framework import PluginResult
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="plugin_token")
+        request = SimpleNamespace(state=SimpleNamespace(), client=None, headers={})
+
+        mock_pm = MagicMock()
+        mock_pm.has_hooks_for = MagicMock(return_value=True)
+        mock_pm.config = SimpleNamespace(plugin_settings=SimpleNamespace(include_user_info=False))
+        mock_pm.invoke_hook = AsyncMock(
+            return_value=(
+                PluginResult(
+                    modified_payload={"email": "plugin@example.com", "is_admin": True},
+                    continue_processing=False,
+                    metadata={"auth_method": "plugin"},
+                ),
+                None,
+            )
+        )
+
+        db_user = EmailUser(
+            email="plugin@example.com",
+            password_hash="h",
+            full_name="Plugin User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=db_user),
+        ):
+            user = await get_current_user(credentials=credentials, request=request)
+
+        assert user.is_admin is False
+
+    @pytest.mark.asyncio
+    async def test_plugin_auth_missing_user_rejected_when_require_user_in_db_enabled(self, monkeypatch):
+        """Missing DB users are rejected when REQUIRE_USER_IN_DB is enabled."""
+        # First-Party
+        from mcpgateway.plugins.framework import PluginResult
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="plugin_token")
+        request = SimpleNamespace(state=SimpleNamespace(), client=None, headers={})
+
+        mock_pm = MagicMock()
+        mock_pm.has_hooks_for = MagicMock(return_value=True)
+        mock_pm.config = SimpleNamespace(plugin_settings=SimpleNamespace(include_user_info=False))
+        mock_pm.invoke_hook = AsyncMock(
+            return_value=(
+                PluginResult(
+                    modified_payload={"email": "missing@example.com", "is_admin": True},
+                    continue_processing=False,
+                    metadata={"auth_method": "plugin"},
+                ),
+                None,
+            )
+        )
+
+        monkeypatch.setattr(settings, "require_user_in_db", True)
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=None),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_current_user(credentials=credentials, request=request)
+
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "User not found in database"
+
+    @pytest.mark.asyncio
+    async def test_plugin_auth_existing_db_inactive_user_rejected(self):
+        """Inactive DB users must be rejected even when plugin auth succeeds."""
+        # First-Party
+        from mcpgateway.plugins.framework import PluginResult
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="plugin_token")
+        request = SimpleNamespace(state=SimpleNamespace(), client=None, headers={})
+
+        mock_pm = MagicMock()
+        mock_pm.has_hooks_for = MagicMock(return_value=True)
+        mock_pm.config = SimpleNamespace(plugin_settings=SimpleNamespace(include_user_info=False))
+        mock_pm.invoke_hook = AsyncMock(
+            return_value=(
+                PluginResult(
+                    modified_payload={"email": "disabled@example.com", "is_admin": True},
+                    continue_processing=False,
+                    metadata={"auth_method": "plugin"},
+                ),
+                None,
+            )
+        )
+
+        db_user = EmailUser(
+            email="disabled@example.com",
+            password_hash="h",
+            full_name="Disabled User",
+            is_admin=False,
+            is_active=False,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=db_user),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_current_user(credentials=credentials, request=request)
+
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "Account disabled"
+
+    @pytest.mark.asyncio
+    async def test_plugin_auth_missing_user_defaults_to_non_admin_when_allowed(self, monkeypatch):
+        """Missing DB users can authenticate as non-admin when DB-only mode is disabled."""
+        # First-Party
+        from mcpgateway.plugins.framework import PluginResult
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="plugin_token")
+        request = SimpleNamespace(state=SimpleNamespace(), client=None, headers={})
+
+        mock_pm = MagicMock()
+        mock_pm.has_hooks_for = MagicMock(return_value=True)
+        mock_pm.config = SimpleNamespace(plugin_settings=SimpleNamespace(include_user_info=False))
+        mock_pm.invoke_hook = AsyncMock(
+            return_value=(
+                PluginResult(
+                    modified_payload={"email": "new@example.com", "is_admin": True, "full_name": "New User"},
+                    continue_processing=False,
+                    metadata={"auth_method": "plugin"},
+                ),
+                None,
+            )
+        )
+
+        monkeypatch.setattr(settings, "require_user_in_db", False)
+        with (
+            patch("mcpgateway.auth.get_plugin_manager", return_value=mock_pm),
+            patch("mcpgateway.auth.get_correlation_id", return_value="req-1"),
+            patch("mcpgateway.auth._get_user_by_email_sync", return_value=None),
+        ):
+            user = await get_current_user(credentials=credentials, request=request)
+
+        assert user.email == "new@example.com"
+        assert user.is_admin is False
 
     @pytest.mark.asyncio
     async def test_cache_session_token_falls_through_and_resolves_teams(self, monkeypatch):
@@ -2202,12 +3614,18 @@ class TestSessionTokenBranches:
 
     @pytest.mark.asyncio
     async def test_batched_session_token_caches_team_list(self, monkeypatch):
-        """Batched session token populates teams-list cache (line 996)."""
+        """Batched session token caches raw DB teams, not the narrowed intersection.
+
+        The JWT claims teams=["t1"] so the narrowed result is ["t1"], but the
+        cache must receive the full batch_teams=["t1","t2"] so that other
+        sessions for the same user can narrow independently.
+        """
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="jwt")
         payload = {
             "sub": "user@example.com",
             "jti": "jti-1",
             "token_use": "session",
+            "teams": ["t1"],  # narrows intersection to ["t1"]
             "user": {"auth_provider": "local"},
         }
         auth_ctx = {
@@ -2234,4 +3652,15 @@ class TestSessionTokenBranches:
             user = await get_current_user(credentials=credentials)
 
         assert user.email == "user@example.com"
-        mock_cache.set_user_teams.assert_called_once()
+        # Must cache raw DB teams (batch_teams=["t1","t2"]), not the narrowed
+        # intersection (["t1"]), to prevent cross-session cache poisoning.
+        mock_cache.set_user_teams.assert_called_once_with("user@example.com:True", ["t1", "t2"])
+
+
+def test_resolve_plugin_authenticated_user_sync_returns_none_for_missing_email():
+    """Plugin-auth helper should reject empty or missing email claims."""
+    # First-Party
+    import mcpgateway.auth as auth_module
+
+    assert auth_module._resolve_plugin_authenticated_user_sync({}) is None
+    assert auth_module._resolve_plugin_authenticated_user_sync({"email": "   "}) is None
